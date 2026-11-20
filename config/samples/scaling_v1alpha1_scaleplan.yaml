@@ -1,0 +1,16 @@
+apiVersion: scaling.znlbryuqch.io/v1alpha1
+kind: ScalePlan
+metadata:
+  name: checkout-batch
+  namespace: default
+spec:
+  targetRef:
+    kind: Deployment
+    name: checkout
+  defaultReplicas: 2
+  windows:
+    - name: nightly-import
+      schedule: "55 5 * * *"
+      timeZone: Europe/Prague
+      duration: 2h
+      replicas: 8
