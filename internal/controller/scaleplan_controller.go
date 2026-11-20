@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/robfig/cron/v3"
 	appsv1 "k8s.io/api/apps/v1"
 	scalev1 "k8s.io/api/autoscaling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -18,7 +17,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	scalingv1alpha1 "github.com/znlbryuqch/scheduled-scaling-controller/api/v1alpha1"
+	"github.com/znlbryuqch/scheduled-scaling-controller/internal/schedule"
 )
+
+// fallbackRequeue bounds the sleep between window boundaries.
+const fallbackRequeue = 10 * time.Minute
 
 // ScalePlanReconciler applies the replica counts of open windows to the target
 // Deployment. It owns no child objects; it only writes the scale subresource
@@ -50,14 +53,20 @@ func (r *ScalePlanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		now = r.Now
 	}
 
-	window, replicas, err := r.desiredReplicas(&plan, now())
+	windows, err := schedule.Compile(toScheduleWindows(plan.Spec.Windows))
 	if err != nil {
+		logger.Info("invalid plan", "reason", err.Error())
 		r.setCondition(&plan, metav1.ConditionFalse, "InvalidSchedule", err.Error())
 		if updateErr := r.Status().Update(ctx, &plan); updateErr != nil {
 			logger.Error(updateErr, "updating invalid plan status")
 		}
 		// A bad expression only changes on spec edits, so do not hot loop.
 		return ctrl.Result{}, nil
+	}
+
+	window, replicas := windows.Desired(now())
+	if plan.Spec.DefaultReplicas != nil && window == "" {
+		replicas = *plan.Spec.DefaultReplicas
 	}
 
 	target := types.NamespacedName{Namespace: plan.Namespace, Name: plan.Spec.TargetRef.Name}
@@ -88,66 +97,22 @@ func (r *ScalePlanReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: r.requeueAfter(&plan, now())}, nil
+	return ctrl.Result{RequeueAfter: windows.NextBoundary(now(), fallbackRequeue)}, nil
 }
 
-// desiredReplicas returns the innermost open window and the replica count it
-// demands. An empty window name means no window is open.
-func (r *ScalePlanReconciler) desiredReplicas(plan *scalingv1alpha1.ScalePlan, now time.Time) (string, int32, error) {
-	name, replicas := "", int32(0)
-	if plan.Spec.DefaultReplicas != nil {
-		replicas = *plan.Spec.DefaultReplicas
+// toScheduleWindows narrows the API type to the evaluator input.
+func toScheduleWindows(in []scalingv1alpha1.ScaleWindow) []schedule.Window {
+	out := make([]schedule.Window, 0, len(in))
+	for _, w := range in {
+		out = append(out, schedule.Window{
+			Name:     w.Name,
+			Schedule: w.Schedule,
+			TimeZone: w.TimeZone,
+			Duration: w.Duration.Duration,
+			Replicas: w.Replicas,
+		})
 	}
-	for _, w := range plan.Spec.Windows {
-		open, err := windowOpen(w, now)
-		if err != nil {
-			return "", 0, fmt.Errorf("window %q: %w", w.Name, err)
-		}
-		if open {
-			name, replicas = w.Name, w.Replicas
-		}
-	}
-	return name, replicas, nil
-}
-
-// windowOpen reports whether now falls inside the window opened by the last
-// fire of w.Schedule. Schedules are parsed with seconds optional.
-func windowOpen(w scalingv1alpha1.ScaleWindow, now time.Time) (bool, error) {
-	loc, err := time.LoadLocation(orDefault(w.TimeZone, "UTC"))
-	if err != nil {
-		return false, fmt.Errorf("loading time zone: %w", err)
-	}
-	sched, err := cron.ParseStandard(w.Schedule)
-	if err != nil {
-		return false, fmt.Errorf("parsing schedule: %w", err)
-	}
-	fires := sched.Next(now.Add(-7 * 24 * time.Hour).In(loc))
-	last := fires
-	for fires.Before(now.In(loc)) {
-		last = fires
-		fires = sched.Next(fires)
-	}
-	return now.In(loc).Before(last.Add(w.Duration.Duration)), nil
-}
-
-// requeueAfter wakes the controller at the next window boundary of the plan.
-func (r *ScalePlanReconciler) requeueAfter(plan *scalingv1alpha1.ScalePlan, now time.Time) time.Duration {
-	const fallback = 10 * time.Minute
-	next := fallback
-	for _, w := range plan.Spec.Windows {
-		loc, err := time.LoadLocation(orDefault(w.TimeZone, "UTC"))
-		if err != nil {
-			continue
-		}
-		sched, err := cron.ParseStandard(w.Schedule)
-		if err != nil {
-			continue
-		}
-		if d := sched.Next(now.In(loc)).Sub(now); d > 0 && d < next {
-			next = d
-		}
-	}
-	return next
+	return out
 }
 
 func (r *ScalePlanReconciler) setCondition(plan *scalingv1alpha1.ScalePlan, status metav1.ConditionStatus, reason, msg string) {
@@ -159,13 +124,6 @@ func (r *ScalePlanReconciler) setCondition(plan *scalingv1alpha1.ScalePlan, stat
 		ObservedGeneration: plan.Generation,
 		LastTransitionTime: metav1.Now(),
 	})
-}
-
-func orDefault(v, def string) string {
-	if v == "" {
-		return def
-	}
-	return v
 }
 
 // SetupWithManager registers the reconciler for ScalePlan resources.
