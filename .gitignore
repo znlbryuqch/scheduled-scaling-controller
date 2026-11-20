@@ -1,0 +1,14 @@
+# Binaries
+bin/
+manager
+scheduled-scaling-controller
+
+# Test output
+coverage.out
+*.test
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
